@@ -59,6 +59,9 @@ contract StreamVault is ReentrancyGuard, Pausable {
     error StreamVault__AmountZero();
     error StreamVault__AmountTooLarge();
     error StreamVault__BadPayer();
+    error StreamVault__NotPayee();
+    error StreamVault__NothingToClaim();
+    error StreamVault__AlreadyCanceled();
 
     modifier onlyOwner() {
         require(msg.sender == owner, "not owner");
@@ -144,5 +147,52 @@ contract StreamVault is ReentrancyGuard, Pausable {
         s.funded += uint128(amount);
 
         emit StreamFunded(id, from, amount);
+    }
+
+    function claim(uint256 id) external whenNotPaused nonReentrant returns (uint256 paid) {
+        Stream storage s = _getStream(id);
+        if (msg.sender != s.payee)
+            revert StreamVault__NotPayee();
+        paid = _claim(s, id);
+    }
+
+    function claimOnBehalf(uint256 id) external whenNotPaused nonReentrant returns (uint256 paid) {
+        Stream storage s = _getStream(id);
+        paid = _claim(s, id);
+    }
+
+    function _claim(Stream storage s, uint256 id) internal returns (uint256 paid) {
+        paid = claimable(id);
+        if (paid == 0)
+            revert StreamVault__NothingToClaim();
+        s.claimed += uint128(paid);
+        USDC.safeTransfer(s.payee, paid);
+        emit StreamClaimed(id, s.payee, paid);
+    }
+
+    function cancel(uint256 id) external whenNotPaused nonReentrant {
+        Stream storage s = _getStream(id);
+        if (msg.sender != s.payer)
+            revert StreamVault__NotPayer();
+        if (s.canceled == true)
+            revert StreamVault__AlreadyCanceled();
+        uint40 nowT = uint40(block.timestamp);
+        if (nowT < s.end)
+            s.end = nowT;
+        s.canceled = true;
+        totalRate -= s.rate;
+        // refund to payer
+        emit StreamCanceled(id);
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    function emergencyWithdraw(address token, address to, uint256 amount) external onlyOwner {
+        IERC20(token).transfer(to, amount);
     }
 }
