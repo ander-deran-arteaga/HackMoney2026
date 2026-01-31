@@ -95,22 +95,20 @@ contract StreamVault is ReentrancyGuard, Pausable {
     }
 
     function claimable(uint256 id) public view returns (uint256) {
-        Stream memory s = streams[id];
+        Stream storage s = _getStream(id);
         uint256 a = accrued(id);
-        if (a <= s.claimed)
-            return 0;
-        return a - s.claimed;
+        return a <= s.claimed ? 0 : a - s.claimed;
     }
 
     function createStream(address payee, uint96 rate, uint40 start, uint40 end) external whenNotPaused returns (uint256 id) {
         if (payee == address(0))
             revert StreamVault__InvalidAddress();
-        if (rate <= 0)
+        if (rate == 0)
             revert StreamVault__InvalidRate();
-        if (!(end > start))
+        if (end <= start)
             revert StreamVault__InvalidTime();
-        nextId++;
-        streams[nextId] = Stream({
+        id = ++nextId;
+        streams[id] = Stream({
             payer: msg.sender,
             payee: payee,
             start: start,
@@ -133,8 +131,8 @@ contract StreamVault is ReentrancyGuard, Pausable {
 
     function fundFor(uint256 id, address payer, uint256 amount) external whenNotPaused nonReentrant {
         Stream storage s = _getStream(id);
-        if (payer == s.payer)
-            revert StreamVault__BadPayer();
+        if (payer != s.payer)
+            revert StreamVault__NotPayer();
         _fund(s, id, msg.sender, amount);
     }
 
@@ -193,6 +191,6 @@ contract StreamVault is ReentrancyGuard, Pausable {
     }
 
     function emergencyWithdraw(address token, address to, uint256 amount) external onlyOwner {
-        IERC20(token).transfer(to, amount);
+        IERC20(token).safeTransfer(to, amount);
     }
 }
