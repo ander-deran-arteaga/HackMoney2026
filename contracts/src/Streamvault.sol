@@ -52,6 +52,13 @@ contract StreamVault is ReentrancyGuard, Pausable {
     event StreamCanceled(uint256 indexed id);
 
     error StreamVault__InvalidStream();
+    error StreamVault__InvalidAddress();
+    error StreamVault__InvalidRate();
+    error StreamVault__InvalidTime();
+    error StreamVault__NotPayer();
+    error StreamVault__AmountZero();
+    error StreamVault__AmountTooLarge();
+    error StreamVault__BadPayer();
 
     modifier onlyOwner() {
         require(msg.sender == owner, "not owner");
@@ -62,13 +69,16 @@ contract StreamVault is ReentrancyGuard, Pausable {
         return a < b ? a : b;
     }
 
-    function accrued(uint256 id) public view returns (uint256) {
-        if (id == 0 || id > nextId) {
+    function _getStream(uint256 id) internal view returns (Stream storage s) {
+        if (id == 0)
             revert StreamVault__InvalidStream();
-        }
-        Stream storage s = streams[id];
+        s = streams[id];
         if (s.payer == address(0))
             revert StreamVault__InvalidStream();
+    }
+
+    function accrued(uint256 id) public view returns (uint256) {
+        Stream storage s = _getStream(id);
         uint256 t = block.timestamp;
         if (t <= s.start) {
             return 0;
@@ -87,5 +97,52 @@ contract StreamVault is ReentrancyGuard, Pausable {
         if (a <= s.claimed)
             return 0;
         return a - s.claimed;
+    }
+
+    function createStream(address payee, uint96 rate, uint40 start, uint40 end) external whenNotPaused returns (uint256 id) {
+        if (payee == address(0))
+            revert StreamVault__InvalidAddress();
+        if (rate <= 0)
+            revert StreamVault__InvalidRate();
+        if (!(end > start))
+            revert StreamVault__InvalidTime();
+        nextId++;
+        streams[nextId] = Stream({
+            payer: msg.sender,
+            payee: payee,
+            start: start,
+            end: end,
+            rate: rate,
+            funded: 0,
+            claimed: 0,
+            canceled: false
+        });
+        totalRate += rate;
+        emit StreamCreated(id, msg.sender, payee, rate, start, end);
+    }
+
+    function fund(uint256 id, uint256 amount) external whenNotPaused nonReentrant {
+        Stream storage s = _getStream(id);
+        if (msg.sender != s.payer)
+            revert StreamVault__NotPayer();
+        _fund(s, id, msg.sender, amount);
+    }
+
+    function fundFor(uint256 id, address payer, uint256 amount) external whenNotPaused nonReentrant {
+        Stream storage s = _getStream(id);
+        if (payer == s.payer)
+            revert StreamVault__BadPayer();
+        _fund(s, id, msg.sender, amount);
+    }
+
+    function _fund(Stream storage s, uint256 id, address from, uint256 amount) internal {
+        if (amount == 0)
+            revert StreamVault__AmountZero();
+        if (amount > type(uint128).max - s.funded)
+            revert StreamVault__AmountTooLarge();
+        USDC.safeTransferFrom(from, address(this), amount);
+        s.funded += uint128(amount);
+
+        emit StreamFunded(id, from, amount);
     }
 }
