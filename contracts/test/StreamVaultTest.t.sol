@@ -74,7 +74,7 @@ contract StreamVaultTest is Test {
         assertEq(refunded, 95e6);
         uint256 payerBalAfter = usdc.balanceOf(payer);
         assertEq(payerBalAfter - payerBalBefore, 95e6);
-        (, , , uint40 storedEnd, , , , bool canceled) = streamVault.streams(id);
+        (, , , uint40 storedEnd, , , , bool canceled,) = streamVault.streams(id);
         assertEq(storedEnd, cancelT); 
         assertTrue(canceled); 
 
@@ -103,7 +103,7 @@ contract StreamVaultTest is Test {
         // executor funds, but payer attribution must match stream.payer
         vm.prank(executor);
         streamVault.fundFor(id, payer, 100e6);
-        (, , , , , uint128 funded , , ) = streamVault.streams(id);
+        (, , , , , uint128 funded , , ,) = streamVault.streams(id);
         assertEq(funded, 100e6);
     }
 
@@ -126,5 +126,60 @@ contract StreamVaultTest is Test {
         streamVault.pause(); // called by msg.sender that also called the contract so no revert
         vm.expectRevert();
         streamVault.cancel(id);
+    }
+
+    // claimed <= accrued <= funded always
+    function testInvariants(uint96 randomRate, uint40 randomStartTime, uint40 randomEndTime) public {
+        uint96 rate = uint96(bound(uint256(randomRate), 1e6, 5e6));
+        uint40 start = uint40(bound(uint256(randomStartTime), block.timestamp, block.timestamp + 96 hours));
+        uint40 end   = uint40(bound(uint256(randomEndTime), start + 1, start + 96 hours));
+
+        vm.prank(payer);
+        uint256 id = streamVault.createStream(payee, rate, start, end);
+
+        vm.prank(payer);
+        streamVault.fund(id, 100e6);
+
+        uint40 t = start + 5;
+        vm.warp(t);
+        uint256 endT = t < end ? t : end;
+        uint256 expected = endT <= start ? 0 : uint256(rate) * (endT - start);
+
+        assertEq(streamVault.accrued(id), expected);
+    }
+
+    function testPokeCloseCorrectlyByTime() public {
+        uint96 rate = 1e6; 
+        uint40 start = uint40(block.timestamp);
+        uint40 end = start + uint40(24 hours);
+
+        vm.prank(payer);
+        uint256 id = streamVault.createStream(payee, rate, start, end);
+        vm.prank(payer);
+        streamVault.fund(id, 100e6);
+        vm.warp(start + 25 hours);
+        streamVault.poke(id);
+        ( , , , , , , , , bool closed) = streamVault.streams(id);
+        assertEq(closed, true);
+    }
+
+    function testOutOfFundsThenPokeThenFundAndReopens() public {
+        uint96 rate = 1e6; 
+        uint40 start = uint40(block.timestamp);
+        uint40 end = start + uint40(24 hours);
+
+        vm.prank(payer);
+        uint256 id = streamVault.createStream(payee, rate, start, end);
+        vm.prank(payer);
+        streamVault.fund(id, 3e6);
+        vm.warp(start + 5);
+        streamVault.poke(id);
+        ( , , , , , , , , bool closed) = streamVault.streams(id);
+        assertEq(closed, true);
+        vm.prank(payer);
+        streamVault.fund(id, 100e6);
+        streamVault.poke(id);
+        ( , , , , , , , , closed) = streamVault.streams(id);
+        assertEq(closed, false);
     }
 }

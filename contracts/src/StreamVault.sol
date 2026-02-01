@@ -26,10 +26,11 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
       address payee;
       uint40  start;
       uint40  end;
-      uint96  rate;     // USDC per second, 6 decimals
+      uint256  rate;     // USDC per second, 6 decimals
       uint128 funded;   // total funded
       uint128 claimed;  // total claimed
       bool    canceled;
+      bool    closed;
     }
 
     IERC20 public immutable USDC;
@@ -38,18 +39,22 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
     mapping(uint256 => Stream) public streams;
 
     // For buffer logic later
-    uint96 public totalRate;       // sum of rates for active streams
+    uint256 public totalRate;       // sum of rates for active streams
     uint32 public bufferDays = 3;
 
     constructor(address usdc) Ownable(msg.sender) {
       USDC = IERC20(usdc);
     }
 
-    event StreamCreated(uint256 indexed id, address indexed payer, address indexed payee, uint96 rate, uint40 start, uint40 end);
+    event StreamCreated(uint256 indexed id, address indexed payer, address indexed payee, uint256 rate, uint40 start, uint40 end);
     event StreamFunded(uint256 indexed id, address indexed from, uint256 amount);
     event StreamClaimed(uint256 indexed id, address indexed payee, uint256 amount);
     event StreamCanceled(uint256 indexed id);
     event StreamRefunded(uint256 indexed id, address indexed payer, uint256 amount);
+    event StreamFinished(uint256 indexed id);
+    event StreamReopened(uint256 indexed id);
+    event RebalanceComputed(uint256 buffer, uint256 target, int256 delta);
+
 
     error StreamVault__InvalidStream();
     error StreamVault__InvalidAddress();
@@ -84,11 +89,11 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
             return 0;
         }
         uint256 endT = _min(t, s.end);
-        uint256 maxEnd = uint256(s.start) + uint256(s.funded) / uint256(s.rate);
+        uint256 maxEnd = uint256(s.start) + uint256(s.funded) / s.rate;
         endT = _min(endT, maxEnd);
         if (endT <= s.start)
             return 0;
-        return uint256(s.rate) * (endT - uint256(s.start));
+        return s.rate * (endT - uint256(s.start));
     }
 
     function claimable(uint256 id) public view returns (uint256) {
@@ -97,7 +102,7 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
         return a <= s.claimed ? 0 : a - s.claimed;
     }
 
-    function createStream(address payee, uint96 rate, uint40 start, uint40 end) external whenNotPaused returns (uint256 id) {
+    function createStream(address payee, uint256 rate, uint40 start, uint40 end) external whenNotPaused returns (uint256 id) {
         if (payee == address(0))
             revert StreamVault__InvalidAddress();
         if (rate == 0)
@@ -113,7 +118,8 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
             rate: rate,
             funded: 0,
             claimed: 0,
-            canceled: false
+            canceled: false,
+            closed: false
         });
         totalRate += rate;
         emit StreamCreated(id, msg.sender, payee, rate, start, end);
@@ -140,6 +146,11 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
             revert StreamVault__AmountTooLarge();
         USDC.safeTransferFrom(from, address(this), amount);
         s.funded += uint128(amount);
+        if (s.closed && !s.canceled && !_noMoreAccrual(s)) {
+            s.closed = false;
+            totalRate += s.rate;
+            emit StreamReopened(id);
+        }
 
         emit StreamFunded(id, from, amount);
     }
@@ -179,8 +190,11 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
             revert StreamVault__FundedBelowClaimed();
         uint256 funded_ = uint256(s.funded);
         refundable = funded_ > a ? funded_ - a : 0;
+        if (!s.closed) {
+            s.closed = true;
+            totalRate -= s.rate;
+        }   
         s.canceled = true;
-        totalRate -= s.rate;
         // recorta funded a lo que realmente queda “reservado” para el payee
         s.funded = uint128(a);
         if (refundable != 0) {
@@ -188,6 +202,29 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
             emit StreamRefunded(id, s.payer, refundable);
         }
         emit StreamCanceled(id);
+    }
+
+    function _effectiveEnd(Stream storage s) internal view returns (uint256) {
+        uint256 maxEnd = uint256(s.start) + uint256(s.funded) / s.rate;
+        return _min(uint256(s.end), maxEnd);
+    }
+
+    function _noMoreAccrual(Stream storage s) internal view returns (bool) {
+        uint256 effEnd = _effectiveEnd(s);
+        return block.timestamp >= effEnd;
+    }
+
+    function poke(uint256 id) external whenNotPaused nonReentrant returns (bool closedNow) {
+        Stream storage s = _getStream(id);
+        if (s.canceled == true || s.closed == true)
+            return false;
+        if (!_noMoreAccrual(s))
+            return false;
+
+        s.closed = true;
+        totalRate -= s.rate;
+        emit StreamFinished(id);
+        return true;
     }
 
     function pause() external onlyOwner {
@@ -198,5 +235,25 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
     }
     function emergencyWithdraw(address token, address to, uint256 amount) external onlyOwner {
         IERC20(token).safeTransfer(to, amount);
+    }
+
+    function buffer() public view returns (uint256) {
+        return USDC.balanceOf(address(this));
+    }
+
+    function bufferTarget() public view returns (uint256) {
+        return totalRate * uint256(bufferDays) * 1 days;
+    }
+
+    function rebalance() external whenNotPaused returns (uint256 b, uint256 t, int256 d) {
+        b = buffer();
+        t = bufferTarget();
+
+        if (b >= t)
+            d = int256(b - t);
+        else
+            d = -int256(t - b);
+
+        emit RebalanceComputed(b, t, d);
     }
 }
