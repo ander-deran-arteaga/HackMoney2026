@@ -6,6 +6,9 @@ import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "openzeppelin-contracts/contracts/utils/Pausable.sol";
+import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
+import {Ownable2Step} from "openzeppelin-contracts/contracts/access/Ownable2Step.sol";
+
 
 /** Invariants
  * claimed <= accrued <= funded (never pay more that what has been funded).
@@ -15,7 +18,7 @@ import {Pausable} from "openzeppelin-contracts/contracts/utils/Pausable.sol";
  * If rate == 0 or end <= start → revert (no streams inválits).
  * **/
 
-contract StreamVault is ReentrancyGuard, Pausable {
+contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
     using SafeERC20 for IERC20;
 
     struct Stream {
@@ -38,11 +41,7 @@ contract StreamVault is ReentrancyGuard, Pausable {
     uint96 public totalRate;       // sum of rates for active streams
     uint32 public bufferDays = 3;
 
-    // Admin
-    address public owner;
-
-    constructor(address usdc) {
-      owner = msg.sender;
+    constructor(address usdc) Ownable(msg.sender) {
       USDC = IERC20(usdc);
     }
 
@@ -50,23 +49,21 @@ contract StreamVault is ReentrancyGuard, Pausable {
     event StreamFunded(uint256 indexed id, address indexed from, uint256 amount);
     event StreamClaimed(uint256 indexed id, address indexed payee, uint256 amount);
     event StreamCanceled(uint256 indexed id);
+    event StreamRefunded(uint256 indexed id, address indexed payer, uint256 amount);
 
     error StreamVault__InvalidStream();
     error StreamVault__InvalidAddress();
     error StreamVault__InvalidRate();
     error StreamVault__InvalidTime();
-    error StreamVault__NotPayer();
     error StreamVault__AmountZero();
     error StreamVault__AmountTooLarge();
     error StreamVault__BadPayer();
     error StreamVault__NotPayee();
     error StreamVault__NothingToClaim();
     error StreamVault__AlreadyCanceled();
-
-    modifier onlyOwner() {
-        require(msg.sender == owner, "not owner");
-        _;
-    }
+    error StreamVault__FundedBelowClaimed();
+    error StreamVault__Cancel_NotPayer();
+    error StreamVault__Fund_NotPayer();
 
     function _min(uint256 a, uint256 b) internal pure returns (uint256) {
         return a < b ? a : b;
@@ -125,14 +122,14 @@ contract StreamVault is ReentrancyGuard, Pausable {
     function fund(uint256 id, uint256 amount) external whenNotPaused nonReentrant {
         Stream storage s = _getStream(id);
         if (msg.sender != s.payer)
-            revert StreamVault__NotPayer();
+            revert StreamVault__Fund_NotPayer();
         _fund(s, id, msg.sender, amount);
     }
 
     function fundFor(uint256 id, address payer, uint256 amount) external whenNotPaused nonReentrant {
         Stream storage s = _getStream(id);
         if (payer != s.payer)
-            revert StreamVault__NotPayer();
+            revert StreamVault__BadPayer();
         _fund(s, id, msg.sender, amount);
     }
 
@@ -168,18 +165,28 @@ contract StreamVault is ReentrancyGuard, Pausable {
         emit StreamClaimed(id, s.payee, paid);
     }
 
-    function cancel(uint256 id) external whenNotPaused nonReentrant {
+    function cancel(uint256 id) external whenNotPaused nonReentrant returns (uint256 refundable) {
         Stream storage s = _getStream(id);
         if (msg.sender != s.payer)
-            revert StreamVault__NotPayer();
+            revert StreamVault__Cancel_NotPayer();
         if (s.canceled == true)
             revert StreamVault__AlreadyCanceled();
         uint40 nowT = uint40(block.timestamp);
         if (nowT < s.end)
             s.end = nowT;
+        uint256 a = accrued(id);
+        if (a < s.claimed)
+            revert StreamVault__FundedBelowClaimed();
+        uint256 funded_ = uint256(s.funded);
+        refundable = funded_ > a ? funded_ - a : 0;
         s.canceled = true;
         totalRate -= s.rate;
-        // refund to payer
+        // recorta funded a lo que realmente queda “reservado” para el payee
+        s.funded = uint128(a);
+        if (refundable != 0) {
+            USDC.safeTransfer(s.payer, refundable);
+            emit StreamRefunded(id, s.payer, refundable);
+        }
         emit StreamCanceled(id);
     }
 
@@ -189,7 +196,6 @@ contract StreamVault is ReentrancyGuard, Pausable {
     function unpause() external onlyOwner {
         _unpause();
     }
-
     function emergencyWithdraw(address token, address to, uint256 amount) external onlyOwner {
         IERC20(token).safeTransfer(to, amount);
     }

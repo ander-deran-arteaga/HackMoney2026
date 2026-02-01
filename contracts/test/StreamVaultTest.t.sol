@@ -14,6 +14,7 @@ contract StreamVaultTest is Test {
 
     address payer = makeAddr("payer");
     address payee = makeAddr("payee");
+    address owner = makeAddr("owner");
 
     function setUp() public {
         usdc = new MockUSDC();
@@ -67,15 +68,22 @@ contract StreamVaultTest is Test {
         uint40 cancelT = start + 5;
         vm.warp(cancelT);
         assertEq(streamVault.accrued(id), 5e6);
+        uint256 payerBalBefore = usdc.balanceOf(payer);
         vm.prank(payer);
-        streamVault.cancel(id);
+        uint256 refunded = streamVault.cancel(id);
+        assertEq(refunded, 95e6);
+        uint256 payerBalAfter = usdc.balanceOf(payer);
+        assertEq(payerBalAfter - payerBalBefore, 95e6);
         (, , , uint40 storedEnd, , , , bool canceled) = streamVault.streams(id);
-        assertEq(storedEnd, cancelT);
-        assertTrue(canceled);
+        assertEq(storedEnd, cancelT); 
+        assertTrue(canceled); 
 
         vm.warp(start + 10);
-        assertEq(streamVault.accrued(id), 5e6);
-}
+        assertEq(streamVault.accrued(id), 5e6); // cancel congela devengo
+        vm.prank(payee);
+        uint256 claimed = streamVault.claim(id);    
+        assertEq(claimed, 5e6); // payee conserva derecho de cobro
+    }
 
     // fundFor allows executor
     function testFundForAllowsExecutor() public {
@@ -97,5 +105,26 @@ contract StreamVaultTest is Test {
         streamVault.fundFor(id, payer, 100e6);
         (, , , , , uint128 funded , , ) = streamVault.streams(id);
         assertEq(funded, 100e6);
+    }
+
+    function testPause() public {
+        uint96 rate = 1e6; 
+        uint40 start = uint40(block.timestamp);
+        uint40 end = start + uint40(96 hours);
+        address attacker = makeAddr("attacker");
+
+        vm.prank(payer);
+        uint256 id = streamVault.createStream(payee, rate, start, end);
+        vm.prank(payer);
+        streamVault.fund(id, 100e6);
+        uint40 pausedTime = start + 5;
+        vm.warp(pausedTime);
+        vm.prank(attacker);
+        vm.expectRevert();
+        streamVault.pause(); // Reverted
+
+        streamVault.pause(); // called by msg.sender that also called the contract so no revert
+        vm.expectRevert();
+        streamVault.cancel(id);
     }
 }
