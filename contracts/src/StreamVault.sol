@@ -8,6 +8,7 @@ import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/Reentrancy
 import {Pausable} from "openzeppelin-contracts/contracts/utils/Pausable.sol";
 import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
 import {Ownable2Step} from "openzeppelin-contracts/contracts/access/Ownable2Step.sol";
+import {ITeller} from "./IYieldAdapter.sol";
 
 
 /** Invariants
@@ -42,6 +43,13 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
     uint256 public totalRate;       // sum of rates for active streams
     uint32 public bufferDays = 3;
 
+    // yield config
+    bool public yieldEnabled = false;
+    address public teller;
+    address public usyc;
+    uint16 public perfFeeBps; // e.g. 200 = 2%
+    address public feeRecipient;
+
     constructor(address usdc) Ownable(msg.sender) {
       USDC = IERC20(usdc);
     }
@@ -54,7 +62,11 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
     event StreamFinished(uint256 indexed id);
     event StreamReopened(uint256 indexed id);
     event RebalanceComputed(uint256 buffer, uint256 target, int256 delta);
-
+    event YieldConfigSet(address teller, address usyc);
+    event YieldEnabledSet(bool enabled);
+    event PerfFeeSet(uint16 bps);
+    event YieldDeposited(uint256 amount, uint256 sharesOut);
+    event YieldRedeemed(uint256 sharesIn, uint256 assetsOut);
 
     error StreamVault__InvalidStream();
     error StreamVault__InvalidAddress();
@@ -62,6 +74,7 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
     error StreamVault__InvalidTime();
     error StreamVault__AmountZero();
     error StreamVault__AmountTooLarge();
+    error StreamVault__AmountTooLow();
     error StreamVault__BadPayer();
     error StreamVault__NotPayee();
     error StreamVault__NothingToClaim();
@@ -69,6 +82,9 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
     error StreamVault__FundedBelowClaimed();
     error StreamVault__Cancel_NotPayer();
     error StreamVault__Fund_NotPayer();
+    error StreamVault__BadFeeBps();
+    error StreamVault__YieldNotEnabled();
+    error StreamVault__DidNotIncrease();
 
     function _min(uint256 a, uint256 b) internal pure returns (uint256) {
         return a < b ? a : b;
@@ -227,16 +243,6 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
         return true;
     }
 
-    function pause() external onlyOwner {
-        _pause();
-    }
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-    function emergencyWithdraw(address token, address to, uint256 amount) external onlyOwner {
-        IERC20(token).safeTransfer(to, amount);
-    }
-
     function buffer() public view returns (uint256) {
         return USDC.balanceOf(address(this));
     }
@@ -253,7 +259,89 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
             d = int256(b - t);
         else
             d = -int256(t - b);
-
         emit RebalanceComputed(b, t, d);
+    }
+
+    function setYieldConfig(address _teller, address _usyc) external onlyOwner {
+        teller = _teller;
+        usyc = _usyc;
+        USDC.forceApprove(_teller, type(uint256).max);
+
+        emit YieldConfigSet(_teller, _usyc);
+    }
+
+    function setYieldEnabled(bool _yieldEnabled) external onlyOwner {
+        yieldEnabled = _yieldEnabled;
+        emit YieldEnabledSet(_yieldEnabled);
+    }
+
+    function setPerfFeeBps(uint16 _perfFeeBps) external onlyOwner {
+        if (_perfFeeBps > 2000)
+            revert StreamVault__BadFeeBps(); // max 20%
+        perfFeeBps = _perfFeeBps;
+        emit PerfFeeSet(_perfFeeBps);
+    }
+
+    function _yieldDeposit(uint256 amount) internal returns (uint256 sharesOut) {
+        if (!yieldEnabled)
+            revert StreamVault__YieldNotEnabled();
+        if (amount == 0)
+            revert StreamVault__AmountZero();
+
+        uint256 bal = USDC.balanceOf(address(this));
+        if (bal < amount)
+            revert StreamVault__AmountTooLow();
+
+        uint256 usycBefore = IERC20(usyc).balanceOf(address(this));
+
+        sharesOut = ITeller(teller).deposit(amount, address(this));
+
+        uint256 usycAfter = IERC20(usyc).balanceOf(address(this));
+
+        if (usycAfter <= usycBefore)
+            revert StreamVault__DidNotIncrease();
+
+        emit YieldDeposited(amount, sharesOut);
+    }
+
+        function yieldDeposit(uint256 amount) external onlyOwner nonReentrant whenNotPaused returns (uint256 sharesOut) {
+            return _yieldDeposit(amount);
+        }
+
+        function _yieldRedeemAll() internal returns (uint256 assetsOut, uint256 sharesIn) {
+        if (!yieldEnabled)
+            revert StreamVault__YieldNotEnabled();
+
+        sharesIn = IERC20(usyc).balanceOf(address(this));
+        if (sharesIn == 0)
+            revert StreamVault__AmountZero();
+        uint256 usdcBefore = USDC.balanceOf(address(this));
+        uint256 usycBefore = sharesIn;
+
+        assetsOut = ITeller(teller).redeem(sharesIn, address(this), address(this));
+
+        uint256 usdcAfter = USDC.balanceOf(address(this));
+        uint256 usycAfter = IERC20(usyc).balanceOf(address(this));
+
+        if (usdcAfter <= usdcBefore)
+            revert StreamVault__DidNotIncrease();
+        if (usycAfter >= usycBefore)
+            revert StreamVault__DidNotIncrease();
+
+        emit YieldRedeemed(sharesIn, assetsOut);
+    }
+
+    function yieldRedeemAll() external onlyOwner nonReentrant whenNotPaused returns (uint256 assetsOut, uint256 sharesIn) {
+        return _yieldRedeemAll();
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+    function emergencyWithdraw(address token, address to, uint256 amount) external onlyOwner {
+        IERC20(token).safeTransfer(to, amount);
     }
 }
