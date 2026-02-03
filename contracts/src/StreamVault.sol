@@ -50,6 +50,12 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
     uint16 public perfFeeBps; // e.g. 200 = 2%
     address public feeRecipient;
 
+    // rebalance
+    uint40 public lastRebalance;
+    uint32 public rebalanceCooldown = 120; // seconds
+    uint256 public minEpsilon = 1e6;       // 1 USDC (6 decimals)
+    uint16 public epsilonBps = 100;        // 1%
+
     constructor(address usdc) Ownable(msg.sender) {
       USDC = IERC20(usdc);
     }
@@ -67,6 +73,7 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
     event PerfFeeSet(uint16 bps);
     event YieldDeposited(uint256 amount, uint256 sharesOut);
     event YieldRedeemed(uint256 sharesIn, uint256 assetsOut);
+    event RebalanceNoAction(uint256 buffer, uint256 target, int256 delta, string reason);
 
     error StreamVault__InvalidStream();
     error StreamVault__InvalidAddress();
@@ -85,9 +92,15 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
     error StreamVault__BadFeeBps();
     error StreamVault__YieldNotEnabled();
     error StreamVault__DidNotIncrease();
+    error StreamVault__RebalanceCooldown();
+    error StreamVault__InsufficientLiquidity(uint256 needed, uint256 available);
 
     function _min(uint256 a, uint256 b) internal pure returns (uint256) {
         return a < b ? a : b;
+    }
+
+    function _max(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a > b ? a : b;
     }
 
     function _getStream(uint256 id) internal view returns (Stream storage s) {
@@ -188,6 +201,7 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
         if (paid == 0)
             revert StreamVault__NothingToClaim();
         s.claimed += uint128(paid);
+        _ensureLiquidity(paid);
         USDC.safeTransfer(s.payee, paid);
         emit StreamClaimed(id, s.payee, paid);
     }
@@ -214,6 +228,7 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
         // recorta funded a lo que realmente queda “reservado” para el payee
         s.funded = uint128(a);
         if (refundable != 0) {
+            _ensureLiquidity(refundable);
             USDC.safeTransfer(s.payer, refundable);
             emit StreamRefunded(id, s.payer, refundable);
         }
@@ -251,15 +266,55 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
         return totalRate * uint256(bufferDays) * 1 days;
     }
 
-    function rebalance() external whenNotPaused returns (uint256 b, uint256 t, int256 d) {
+    function _epsilon(uint256 target) internal view returns (uint256) {
+        uint256 eps = target / 10000 * epsilonBps; // target * bps / 1e4
+        if (eps < minEpsilon) eps = minEpsilon;
+        return eps;
+    }
+
+    function rebalance() external whenNotPaused nonReentrant returns (uint256 b, uint256 t, int256 d) {
         b = buffer();
         t = bufferTarget();
+        d = (b >= t) ? int256(b - t) : -int256(t - b);
 
-        if (b >= t)
-            d = int256(b - t);
-        else
-            d = -int256(t - b);
+        // Always emit the computed state (useful for judges + debugging)
         emit RebalanceComputed(b, t, d);
+
+        // safe-by-default: NEVER move funds unless fully configured
+        bool canYield = yieldEnabled && teller != address(0) && usyc != address(0);
+
+        // also: if no active streams, don't invest anything (avoid "invest-all" trap)
+        if (!canYield || totalRate == 0) {
+            return (b, t, d);
+        }
+
+        // hysteresis
+        uint256 eps = _epsilon(t);
+        uint256 absDelta = d >= 0 ? uint256(d) : uint256(-d);
+        if (absDelta <= eps) {
+            return (b, t, d);
+        }
+
+        // cooldown ONLY if we are actually going to act
+        if (block.timestamp < uint256(lastRebalance) + uint256(rebalanceCooldown)) {
+            revert StreamVault__RebalanceCooldown();
+        }
+        lastRebalance = uint40(block.timestamp);
+
+        // actions (MVP)
+        if (d > 0) {
+            // buffer too high: invest surplus
+            _yieldDeposit(absDelta);
+        } else {
+            // buffer too low: redeem (MVP = redeemAll; later implement redeemExact(absDelta))
+            // buffer demasiado bajo -> intentar recuperar liquidez
+            uint256 shares = IERC20(usyc).balanceOf(address(this));
+            if (shares > 0) {
+                _yieldRedeemAll(); // MVP: trae todo de vuelta
+            } else {//no hay nada invertido
+                emit RebalanceNoAction(b, t, d, "no usyc to redeem");
+            }
+        }
     }
 
     function setYieldConfig(address _teller, address _usyc) external onlyOwner {
@@ -333,6 +388,26 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
 
     function yieldRedeemAll() external onlyOwner nonReentrant whenNotPaused returns (uint256 assetsOut, uint256 sharesIn) {
         return _yieldRedeemAll();
+    }
+
+    function _ensureLiquidity(uint256 needed) internal {
+        if (needed == 0)
+         return;
+        uint256 bal = USDC.balanceOf(address(this));
+        if (bal >= needed)
+            return;
+        
+        bool canYield = yieldEnabled && teller != address(0) && usyc != address(0);
+        if (canYield) {
+        uint256 shares = IERC20(usyc).balanceOf(address(this));
+        if (shares > 0) {
+            _yieldRedeemAll(); // intenta traer todo a USDC
+            bal = USDC.balanceOf(address(this));
+            if (bal >= needed) return;
+        }
+    }
+
+    revert StreamVault__InsufficientLiquidity(needed, bal);
     }
 
     function pause() external onlyOwner {
