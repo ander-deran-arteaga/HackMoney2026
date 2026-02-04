@@ -5,24 +5,29 @@ pragma solidity 0.8.24;
 import {Test, console} from "forge-std/Test.sol";
 import {StreamVault} from "../src/StreamVault.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+import {MockUSYC} from "./mocks/MockUSYC.sol";
+import {MockTeller} from "./mocks/MockTeller.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
-
 
 contract StreamVaultTest is Test {
     StreamVault streamVault;
+    MockTeller teller;
     MockUSDC usdc;
+    MockUSYC usyc;
 
     address payer = makeAddr("payer");
     address payee = makeAddr("payee");
-    address owner = makeAddr("owner");
 
     function setUp() public {
         usdc = new MockUSDC();
+        usyc = new MockUSYC();
+        teller = new MockTeller(address(usdc), address(usyc));
         streamVault = new StreamVault(address(usdc));
         usdc.mint(payer, 1000e6); // 1000 USDC to payer
         // payer approves vault for fund()
         vm.prank(payer);
         IERC20(address(usdc)).approve(address(streamVault), type(uint256).max);
+        usyc.setMinter(address(teller));
     }
 
     function testAccruedInTime() public {
@@ -181,5 +186,106 @@ contract StreamVaultTest is Test {
         streamVault.poke(id);
         ( , , , , , , , , closed) = streamVault.streams(id);
         assertEq(closed, false);
+    }
+
+    function testRebalanceDepositsWhenBufferAboveTarget() public {
+        // rate pequeño -> target < buffer
+        uint256 rate = 100; // 0.000100 USDC/s
+        uint40 start = uint40(block.timestamp);
+        uint40 end = start + uint40(24 hours);
+
+        vm.prank(payer);
+        uint256 id = streamVault.createStream(payee, rate, start, end);
+
+        vm.prank(payer);
+        streamVault.fund(id, 100e6); // 100 USDC al vault
+
+        // onlyOwner (asumiendo owner == address(this) en setUp)
+        streamVault.setYieldConfig(address(teller), address(usyc));
+        streamVault.setYieldEnabled(true);
+
+        uint256 usdcBefore = IERC20(address(usdc)).balanceOf(address(streamVault));
+        uint256 usycBefore = IERC20(address(usyc)).balanceOf(address(streamVault));
+        // optional: pasar cooldown si lo tienes
+        vm.warp(block.timestamp + 10_000);
+
+        streamVault.rebalance();
+
+        uint256 usdcAfter = IERC20(address(usdc)).balanceOf(address(streamVault));
+        uint256 usycAfter = IERC20(address(usyc)).balanceOf(address(streamVault));
+        assertGt(usycAfter, usycBefore);     // se invirtió -> sube USYC
+        assertLt(usdcAfter, usdcBefore);     // baja USDC en vault
+    }
+
+    
+    function testClaimPullsLiquidityFromYield() public {
+        // --- arrange ---
+        uint256 rate = 1e6; // 1 USDC/s
+        uint40 start = uint40(block.timestamp);
+        uint40 end = start + uint40(1 days);
+
+        vm.prank(payer);
+        uint256 id = streamVault.createStream(payee, rate, start, end);
+
+        // fund stream with 100 USDC
+        vm.prank(payer);
+        streamVault.fund(id, 100e6);
+
+        // enable yield + set mocks
+        streamVault.setYieldConfig(address(teller), address(usyc));
+        streamVault.setYieldEnabled(true);
+
+        // invest almost all USDC, leave only 0.1 USDC buffer
+        // 100e6 - 99_900_000 = 100_000 (0.1 USDC)
+        streamVault.yieldDeposit(99_900_000);
+
+        assertEq(usdc.balanceOf(address(streamVault)), 100_000);
+        assertGt(usyc.balanceOf(address(streamVault)), 0);
+
+        // make claimable = 1 USDC (1 second * rate)
+        vm.warp(start + 1);
+
+        // --- act ---
+        vm.prank(payee);
+        uint256 paid = streamVault.claim(id);
+
+        // --- assert ---
+        assertEq(paid, 1e6);
+        assertEq(usdc.balanceOf(payee), 1e6); // payee got paid
+        // optional: with MVP redeemAll, vault likely pulled back a lot of USDC
+        assertGt(usdc.balanceOf(address(streamVault)), 0);
+    }
+
+    function testCancelRefundPullsLiquidityFromYield() public {
+        // --- arrange ---
+        uint256 rate = 1e6; // 1 USDC/s
+        uint40 start = uint40(block.timestamp);
+        uint40 end = start + uint40(1 days);
+
+        vm.prank(payer);
+        uint256 id = streamVault.createStream(payee, rate, start, end);
+
+        // fund stream with 100 USDC
+        vm.prank(payer);
+        streamVault.fund(id, 100e6);
+
+        // enable yield + set mocks
+        streamVault.setYieldConfig(address(teller), address(usyc));
+        streamVault.setYieldEnabled(true);
+
+        // invest almost all USDC, leave only 0.1 USDC buffer
+        // 100e6 - 99_900_000 = 100_000 (0.1 USDC)
+        streamVault.yieldDeposit(99_900_000);
+
+        assertEq(usdc.balanceOf(address(streamVault)), 100_000);
+        assertGt(usyc.balanceOf(address(streamVault)), 0);
+
+        // make claimable = 1 USDC (1 second * rate)
+        vm.warp(start + 1);
+
+        vm.prank(payer);
+        streamVault.cancel(id);
+        assertEq(usdc.balanceOf(address(streamVault)), 1e6); // what has to claim the payee
+        assertEq(usdc.balanceOf(address(payer)), 999000000); // what was yielded
     }
 }

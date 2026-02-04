@@ -321,7 +321,7 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
         teller = _teller;
         usyc = _usyc;
         USDC.forceApprove(_teller, type(uint256).max);
-
+        IERC20(_usyc).forceApprove(_teller, type(uint256).max);
         emit YieldConfigSet(_teller, _usyc);
     }
 
@@ -359,11 +359,11 @@ contract StreamVault is ReentrancyGuard, Pausable, Ownable2Step {
         emit YieldDeposited(amount, sharesOut);
     }
 
-        function yieldDeposit(uint256 amount) external onlyOwner nonReentrant whenNotPaused returns (uint256 sharesOut) {
-            return _yieldDeposit(amount);
-        }
+    function yieldDeposit(uint256 amount) external onlyOwner nonReentrant whenNotPaused returns (uint256 sharesOut) {
+        return _yieldDeposit(amount);
+    }
 
-        function _yieldRedeemAll() internal returns (uint256 assetsOut, uint256 sharesIn) {
+    function _yieldRedeemAll() internal returns (uint256 assetsOut, uint256 sharesIn) {
         if (!yieldEnabled)
             revert StreamVault__YieldNotEnabled();
 

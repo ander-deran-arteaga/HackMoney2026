@@ -6,7 +6,7 @@ import {StreamVault} from "../src/StreamVault.sol";
 import {Script, console2} from "forge-std/Script.sol";
 
 contract DeployStreamVault is Script {
-    function run() public {
+    function run() public { 
         uint256 pk = vm.envUint("PRIVATE_KEY");
         address usdc = vm.envAddress("USDC");
         vm.startBroadcast(pk);
