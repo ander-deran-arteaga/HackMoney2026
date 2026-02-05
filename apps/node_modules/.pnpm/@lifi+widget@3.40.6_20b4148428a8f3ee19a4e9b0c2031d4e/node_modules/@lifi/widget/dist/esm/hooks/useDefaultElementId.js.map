@@ -1,0 +1,1 @@
+{"version":3,"file":"useDefaultElementId.js","sourceRoot":"","sources":["../../../src/hooks/useDefaultElementId.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,eAAe,EAAE,MAAM,+CAA+C,CAAA;AAE/E,MAAM,CAAC,MAAM,mBAAmB,GAAG,GAAG,EAAE;IACtC,MAAM,EAAE,SAAS,EAAE,GAAG,eAAe,EAAE,CAAA;IACvC,OAAO,SAAS,CAAA;AAClB,CAAC,CAAA"}

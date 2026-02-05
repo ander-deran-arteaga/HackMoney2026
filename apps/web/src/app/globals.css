@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+/* Enable class-based dark mode in Tailwind v4 CSS-first */
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  color-scheme: light;
+}
+
+html.dark {
+  color-scheme: dark;
+}
+
+body {
+  min-height: 100vh;
+}

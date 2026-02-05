@@ -1,0 +1,1 @@
+{"version":3,"file":"useSwapOnly.js","sourceRoot":"","sources":["../../../src/hooks/useSwapOnly.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,uBAAuB,EAAE,MAAM,+CAA+C,CAAA;AAEvF,MAAM,CAAC,MAAM,WAAW,GAAG,GAAG,EAAE;IAC9B,MAAM,KAAK,GAAG,uBAAuB,CAAC,CAAC,KAAK,EAAE,EAAE,CAAC,KAAK,CAAC,KAAK,CAAC,CAAA;IAC7D,OAAO,KAAK,KAAK,MAAM,CAAA;AACzB,CAAC,CAAA"}
